@@ -1,7 +1,5 @@
 //! AIR trait extensions for multi-trace proving
 
-use alloc::vec::Vec;
-
 use p3_air::BaseAir;
 use p3_field::{ExtensionField, Field};
 use p3_matrix::dense::RowMajorMatrix;

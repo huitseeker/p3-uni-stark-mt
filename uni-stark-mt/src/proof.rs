@@ -3,16 +3,16 @@
 use alloc::vec::Vec;
 
 /// A multi-trace STARK proof.
-#[derive(Clone, Debug)]
-pub struct Proof<SC: crate::StarkConfig> {
+#[derive(Clone)]
+pub struct Proof<SC: crate::StarkGenericConfig> {
     /// Commitment to the main trace
-    pub main_commit: <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Val>>::Commitment,
+    pub main_commit: <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment,
 
     /// Commitment to the auxiliary trace (None if no aux trace)
-    pub aux_commit: Option<<SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Val>>::Commitment>,
+    pub aux_commit: Option<<SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment>,
 
-    /// Commitments to quotient polynomial chunks
-    pub quotient_commits: Vec<<SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Val>>::Commitment>,
+    /// Commitment to quotient polynomial chunks (all chunks in one commitment)
+    pub quotient_commit: <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Commitment,
 
     /// Opened values of main trace at ζ (out-of-domain point)
     pub main_local: Vec<SC::Challenge>,
@@ -27,10 +27,11 @@ pub struct Proof<SC: crate::StarkConfig> {
     pub aux_next: Vec<SC::Challenge>,
 
     /// Opened values of quotient chunks at ζ
-    pub quotient_chunks: Vec<SC::Challenge>,
+    /// Each chunk is a Vec<Challenge> (all columns in that chunk at zeta)
+    pub quotient_chunks: Vec<Vec<SC::Challenge>>,
 
     /// PCS opening proof
-    pub opening_proof: <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Val>>::Proof,
+    pub opening_proof: <SC::Pcs as p3_commit::Pcs<SC::Challenge, SC::Challenger>>::Proof,
 
     /// Degree (log2 of trace height)
     pub log_degree: u8,

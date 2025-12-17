@@ -18,8 +18,8 @@ extern crate alloc;
 mod air;
 mod config;
 mod folder;
-mod prover;
 mod proof;
+mod prover;
 mod verifier;
 
 pub use air::*;

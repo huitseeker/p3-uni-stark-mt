@@ -3,17 +3,16 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use p3_air::{Air, BaseAir};
-use p3_challenger::{CanObserve, CanSample, FieldChallenger};
+use p3_air::Air;
+use p3_challenger::{CanObserve, CanSample};
 use p3_commit::{Pcs, PolynomialSpace};
-use p3_field::{ExtensionField, Field, PackedField};
+use p3_field::{PackedField, PrimeCharacteristicRing};
 use p3_matrix::dense::RowMajorMatrix;
+use p3_matrix::Matrix;
 use p3_util::log2_strict_usize;
 use tracing::{info_span, instrument};
 
-use crate::{
-    AuxBuilder, AuxTraceBuilder, Challenge, Challenger, MultiTraceAir, Proof, ProverFolder, Val,
-};
+use crate::{Challenge, MultiTraceAir, Proof, ProverFolder, Val};
 
 /// Prove a computation using a multi-trace AIR.
 ///
@@ -37,20 +36,16 @@ pub fn prove<SC, A>(
     public_values: &[Val<SC>],
 ) -> Proof<SC>
 where
-    SC: crate::StarkConfig,
-    SC::Val: PackedField,
+    SC: crate::StarkGenericConfig,
+    Val<SC>: PackedField,
     A: MultiTraceAir<Val<SC>, Challenge<SC>>
         + for<'a> Air<ProverFolder<'a, SC>>
         + for<'a> Air<crate::VerifierFolder<'a, SC>>,
 {
-    assert_eq!(
-        main_trace.width(),
-        air.width(),
-        "Main trace width mismatch"
-    );
+    assert_eq!(main_trace.width(), air.width(), "Main trace width mismatch");
 
     let pcs = config.pcs();
-    let mut challenger = config.challenger();
+    let mut challenger = config.initialise_challenger();
 
     // Trace dimensions
     let height = main_trace.height();
@@ -63,34 +58,28 @@ where
     });
 
     let (main_commit, main_data) =
-        info_span!("pcs_commit_main").in_scope(|| pcs.commit(vec![(trace_domain, main_trace)]));
+        info_span!("pcs_commit_main").in_scope(|| pcs.commit([(trace_domain, main_trace.clone())]));
 
     // Observe main trace commitment
     challenger.observe(main_commit.clone());
     challenger.observe_slice(public_values);
 
     // ==================== PHASE 2: Auxiliary Trace ====================
-    let (aux_commit, aux_data, aux_trace) = if air.aux_width() > 0 {
+    let (aux_commit, aux_data, _aux_trace) = if air.aux_width() > 0 {
         info_span!("auxiliary phase").in_scope(|| {
             // Sample challenges
             let num_challenges = air.num_challenges();
-            let challenges: Vec<Challenge<SC>> = (0..num_challenges)
-                .map(|_| challenger.sample())
-                .collect();
+            let challenges: Vec<Challenge<SC>> =
+                (0..num_challenges).map(|_| challenger.sample()).collect();
 
-            tracing::info!(
-                "Sampled {} challenges for auxiliary trace",
-                num_challenges
-            );
+            tracing::info!("Sampled {} challenges for auxiliary trace", num_challenges);
 
             // Build auxiliary trace using challenges
-            let aux_trace = air.build_aux_trace(
-                &main_data.get_ldes()[0],
-                &challenges,
-            );
+            // Pass the original main_trace (not LDE) to build_aux_trace
+            let aux_trace = air.build_aux_trace(&main_trace, &challenges);
 
             assert_eq!(
-                aux_trace.width(),
+                aux_trace.width,
                 air.aux_width(),
                 "Auxiliary trace width mismatch"
             );
@@ -103,12 +92,13 @@ where
             tracing::info!(
                 "Built auxiliary trace ({}x{})",
                 aux_trace.height(),
-                aux_trace.width()
+                aux_trace.width
             );
 
-            // Commit auxiliary trace
+            // Commit auxiliary trace (flatten to base field first)
+            let aux_trace_flat = aux_trace.clone().flatten_to_base();
             let (aux_commit, aux_data) = info_span!("pcs_commit_aux")
-                .in_scope(|| pcs.commit(vec![(trace_domain, aux_trace.clone())]));
+                .in_scope(|| pcs.commit([(trace_domain, aux_trace_flat)]));
 
             // Observe auxiliary commitment
             challenger.observe(aux_commit.clone());
@@ -157,16 +147,19 @@ where
     let quotient_chunks = quotient_domain.split_evals(quotient_degree, quotient_flat);
     let quotient_chunk_domains = quotient_domain.split_domains(quotient_degree);
 
-    let (quotient_commit_vec, quotient_data_vec): (Vec<_>, Vec<_>) = quotient_chunks
-        .into_iter()
-        .zip(quotient_chunk_domains)
-        .map(|(chunk, dom)| pcs.commit(vec![(dom, chunk)]))
-        .unzip();
+    // Commit all chunks together (not separately)
+    let (quotient_commit, quotient_data) = info_span!("pcs_commit_quotient").in_scope(|| {
+        pcs.commit(
+            quotient_chunk_domains
+                .iter()
+                .copied()
+                .zip(quotient_chunks.into_iter())
+                .collect::<Vec<_>>(),
+        )
+    });
 
-    // Observe quotient commitments
-    for commit in &quotient_commit_vec {
-        challenger.observe(commit.clone());
-    }
+    // Observe quotient commitment
+    challenger.observe(quotient_commit.clone());
 
     // ==================== PHASE 4: Opening ====================
     info_span!("opening").in_scope(|| {
@@ -175,23 +168,23 @@ where
 
     // Sample out-of-domain evaluation point
     let zeta: Challenge<SC> = challenger.sample();
-    let zeta_next = trace_domain.next_point(zeta).expect("domain must support next_point");
+    let zeta_next = trace_domain
+        .next_point(zeta)
+        .expect("domain must support next_point");
 
     // Open all committed polynomials
-    let mut opening_points = vec![
-        (&main_data, vec![vec![zeta, zeta_next]]),
-    ];
+    let mut opening_points = vec![(&main_data, vec![vec![zeta, zeta_next]])];
 
     if let Some(ref aux_data) = aux_data {
         opening_points.push((aux_data, vec![vec![zeta, zeta_next]]));
     }
 
-    for data in &quotient_data_vec {
-        opening_points.push((data, vec![vec![zeta]]));
-    }
+    // Open all quotient chunks at zeta (they're all in one commitment now)
+    let quotient_opening_points: Vec<Vec<Challenge<SC>>> =
+        quotient_chunk_domains.iter().map(|_| vec![zeta]).collect();
+    opening_points.push((&quotient_data, quotient_opening_points));
 
-    let (opened_values, opening_proof) =
-        pcs.open(opening_points, &mut challenger);
+    let (opened_values, opening_proof) = pcs.open(opening_points, &mut challenger);
 
     // Extract opened values
     let mut values_iter = opened_values.into_iter();
@@ -210,14 +203,17 @@ where
     };
 
     // Quotient chunk openings
-    let quotient_chunks = values_iter
-        .map(|vals| vals[0][0].clone())
+    // All quotient chunks were in one commitment, opened at multiple rounds (one per chunk)
+    let quotient_openings = values_iter.next().unwrap();
+    let quotient_chunks: Vec<Vec<Challenge<SC>>> = quotient_openings
+        .iter()
+        .map(|round| round[0].clone())
         .collect();
 
     Proof {
         main_commit,
         aux_commit,
-        quotient_commits: quotient_commit_vec,
+        quotient_commit,
         main_local,
         main_next,
         aux_local,
@@ -232,35 +228,69 @@ where
 #[instrument(skip_all)]
 fn compute_quotient_values<SC, A, M>(
     air: &A,
-    trace_domain: <SC::Pcs as Pcs<SC::Challenge, SC::Val>>::Domain,
-    quotient_domain: <SC::Pcs as Pcs<SC::Challenge, SC::Val>>::Domain,
+    trace_domain: crate::Domain<SC>,
+    quotient_domain: crate::Domain<SC>,
     main_on_quotient: &M,
-    aux_on_quotient: Option<&M>,
+    _aux_on_quotient: Option<&M>,
     alpha: Challenge<SC>,
-    public_values: &[Val<SC>],
+    _public_values: &[Val<SC>],
 ) -> Vec<Challenge<SC>>
 where
-    SC: crate::StarkConfig,
-    SC::Val: PackedField,
+    SC: crate::StarkGenericConfig,
+    Val<SC>: PackedField,
     A: MultiTraceAir<Val<SC>, Challenge<SC>> + for<'a> Air<ProverFolder<'a, SC>>,
     M: p3_matrix::Matrix<Val<SC>> + Sync,
 {
     let quotient_size = quotient_domain.size();
     let width_main = main_on_quotient.width();
-    let width_aux = aux_on_quotient.map(|m| m.width()).unwrap_or(0);
+    let _width_aux = 0; // TODO: Implement proper aux trace handling
 
     // Compute selectors
     let selectors = trace_domain.selectors_on_coset(quotient_domain);
+
+    // Calculate step size between consecutive trace points in quotient domain LDE
+    // quotient_domain is quotient_degree times larger than trace_domain
+    let log_quotient_degree =
+        p3_util::log2_strict_usize(quotient_size) - p3_util::log2_strict_usize(trace_domain.size());
+    let next_step = 1 << log_quotient_degree;
 
     // Evaluate constraints at each point in quotient domain
     // For simplicity, we'll do this in a single-threaded manner
     // TODO: Add parallel evaluation
     let mut quotient_values = Vec::with_capacity(quotient_size);
 
-    // Compute alpha powers (one per constraint)
-    // TODO: Get exact constraint count symbolically
-    let max_constraints = 100; // Conservative upper bound
-    let mut alpha_powers: Vec<Challenge<SC>> = alpha.powers().take(max_constraints).collect();
+    // First pass: count constraints by doing a dry run on first point
+    let main_local: Vec<_> = main_on_quotient.row_slice(0).unwrap().to_vec();
+    let main_next: Vec<_> = main_on_quotient
+        .row_slice(next_step % quotient_size)
+        .unwrap()
+        .to_vec();
+    let main_view =
+        p3_matrix::dense::RowMajorMatrix::new([main_local, main_next].concat(), width_main);
+    let aux_view = p3_matrix::dense::RowMajorMatrix::new(vec![], 0);
+
+    // Create dummy alpha powers for counting (won't be used, just need something)
+    let dummy_alpha_powers = vec![SC::Challenge::ZERO; 100];
+    let mut constraint_counter = ProverFolder {
+        main: main_view.as_view(),
+        aux: aux_view.as_view(),
+        is_first_row: selectors.is_first_row[0],
+        is_last_row: selectors.is_last_row[0],
+        is_transition: selectors.is_transition[0],
+        alpha_powers: &dummy_alpha_powers,
+        accumulator: SC::Challenge::ZERO,
+        constraint_index: 0,
+    };
+    air.eval(&mut constraint_counter);
+    let constraint_count = constraint_counter.constraint_index;
+
+    // Compute exact number of alpha powers and reverse
+    let mut alpha_powers: Vec<Challenge<SC>> = Vec::with_capacity(constraint_count);
+    let mut power = SC::Challenge::ONE;
+    for _ in 0..constraint_count {
+        alpha_powers.push(power);
+        power *= alpha;
+    }
     alpha_powers.reverse();
 
     for i in 0..quotient_size {
@@ -270,33 +300,18 @@ where
         let inv_vanishing = selectors.inv_vanishing[i];
 
         // Get local and next row values
-        let main_local: Vec<_> = (0..width_main)
-            .map(|col| main_on_quotient.get(i, col))
-            .collect();
-        let main_next_idx = (i + 1) % quotient_size;
-        let main_next: Vec<_> = (0..width_main)
-            .map(|col| main_on_quotient.get(main_next_idx, col))
-            .collect();
+        // Next row is next_step away, not just i+1, because quotient domain LDE
+        // interleaves trace points with intermediate evaluation points
+        let main_local: Vec<_> = main_on_quotient.row_slice(i).unwrap().to_vec();
+        let main_next_idx = (i + next_step) % quotient_size;
+        let main_next: Vec<_> = main_on_quotient.row_slice(main_next_idx).unwrap().to_vec();
 
-        let main_view = p3_matrix::dense::RowMajorMatrix::new(
-            [main_local, main_next].concat(),
-            width_main,
-        );
+        let main_view =
+            p3_matrix::dense::RowMajorMatrix::new([main_local, main_next].concat(), width_main);
 
-        let aux_view = if let Some(aux) = aux_on_quotient {
-            let aux_local: Vec<_> = (0..width_aux)
-                .map(|col| aux.get(i, col).into())
-                .collect();
-            let aux_next: Vec<_> = (0..width_aux)
-                .map(|col| aux.get(main_next_idx, col).into())
-                .collect();
-            p3_matrix::dense::RowMajorMatrix::new(
-                [aux_local, aux_next].concat(),
-                width_aux,
-            )
-        } else {
-            p3_matrix::dense::RowMajorMatrix::new(vec![], 0)
-        };
+        // TODO: Implement proper aux trace handling
+        // For now, use empty aux view
+        let aux_view = p3_matrix::dense::RowMajorMatrix::new(vec![], 0);
 
         // Evaluate constraints
         let mut folder = ProverFolder {
@@ -306,7 +321,7 @@ where
             is_last_row,
             is_transition,
             alpha_powers: &alpha_powers,
-            accumulator: Challenge::<SC>::ZERO,
+            accumulator: SC::Challenge::ZERO,
             constraint_index: 0,
         };
 
@@ -314,6 +329,18 @@ where
 
         // quotient(x) = constraints(x) / Z_H(x)
         let quotient_value = folder.accumulator * inv_vanishing;
+
+        // Debug: Check if we're getting reasonable values
+        if i < 3 {
+            tracing::debug!(
+                "Point {}: constraints={:?}, inv_van={:?}, quotient={:?}",
+                i,
+                folder.accumulator,
+                inv_vanishing,
+                quotient_value
+            );
+        }
+
         quotient_values.push(quotient_value);
     }
 

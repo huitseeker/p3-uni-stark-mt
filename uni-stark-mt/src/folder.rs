@@ -1,9 +1,7 @@
 //! Constraint folders for prover and verifier
 
-use alloc::vec::Vec;
-
 use p3_air::{AirBuilder, ExtensionBuilder};
-use p3_field::{Algebra, ExtensionField, Field, PackedField};
+use p3_field::PackedField;
 use p3_matrix::dense::RowMajorMatrixView;
 
 use crate::{Challenge, Val};
@@ -12,31 +10,31 @@ use crate::{Challenge, Val};
 ///
 /// This folder accumulates constraints using random challenges, computing:
 /// `C_0 + α·C_1 + α²·C_2 + ...`
-pub struct ProverFolder<'a, SC: crate::StarkConfig>
+pub struct ProverFolder<'a, SC: crate::StarkGenericConfig>
 where
-    SC::Val: PackedField,
+    Val<SC>: PackedField,
 {
     /// Main trace values (local and next rows, packed)
-    pub main: RowMajorMatrixView<'a, SC::Val>,
+    pub main: RowMajorMatrixView<'a, Val<SC>>,
 
     /// Auxiliary trace values (local and next rows, packed)
     /// Empty if no auxiliary trace
-    pub aux: RowMajorMatrixView<'a, SC::Challenge>,
+    pub aux: RowMajorMatrixView<'a, Challenge<SC>>,
 
     /// Selector: 1 on first row, 0 elsewhere
-    pub is_first_row: SC::Val,
+    pub is_first_row: Val<SC>,
 
     /// Selector: 1 on last row, 0 elsewhere
-    pub is_last_row: SC::Val,
+    pub is_last_row: Val<SC>,
 
     /// Selector: 1 on all rows except last, 0 on last
-    pub is_transition: SC::Val,
+    pub is_transition: Val<SC>,
 
     /// Powers of α for constraint randomization
-    pub alpha_powers: &'a [SC::Challenge],
+    pub alpha_powers: &'a [Challenge<SC>],
 
     /// Accumulated constraint value
-    pub accumulator: SC::Challenge,
+    pub accumulator: Challenge<SC>,
 
     /// Current constraint index
     pub constraint_index: usize,
@@ -44,13 +42,13 @@ where
 
 impl<'a, SC> AirBuilder for ProverFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
-    SC::Val: PackedField,
+    SC: crate::StarkGenericConfig,
+    Val<SC>: PackedField,
 {
     type F = Val<SC>;
-    type Expr = SC::Val;
-    type Var = SC::Val;
-    type M = RowMajorMatrixView<'a, SC::Val>;
+    type Expr = Val<SC>;
+    type Var = Val<SC>;
+    type M = RowMajorMatrixView<'a, Val<SC>>;
 
     fn main(&self) -> Self::M {
         self.main
@@ -79,12 +77,12 @@ where
 
 impl<'a, SC> ExtensionBuilder for ProverFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
-    SC::Val: PackedField,
+    SC: crate::StarkGenericConfig,
+    Val<SC>: PackedField,
 {
-    type EF = SC::Challenge;
-    type ExprEF = SC::Challenge;
-    type VarEF = SC::Challenge;
+    type EF = Challenge<SC>;
+    type ExprEF = Challenge<SC>;
+    type VarEF = Challenge<SC>;
 
     fn assert_zero_ext<I>(&mut self, x: I)
     where
@@ -108,10 +106,10 @@ pub trait AuxBuilder: ExtensionBuilder {
 
 impl<'a, SC> AuxBuilder for ProverFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
-    SC::Val: PackedField,
+    SC: crate::StarkGenericConfig,
+    Val<SC>: PackedField,
 {
-    type MAux = RowMajorMatrixView<'a, SC::Challenge>;
+    type MAux = RowMajorMatrixView<'a, Challenge<SC>>;
 
     fn aux(&self) -> Self::MAux {
         self.aux
@@ -122,42 +120,43 @@ where
 ///
 /// Similar to [`ProverFolder`] but operates on opened polynomial values rather than
 /// full trace matrices.
-pub struct VerifierFolder<'a, SC: crate::StarkConfig> {
+pub struct VerifierFolder<'a, SC: crate::StarkGenericConfig> {
     /// Main trace values (local row)
-    pub main_local: &'a [SC::Challenge],
+    pub main_local: &'a [Challenge<SC>],
 
     /// Main trace values (next row)
-    pub main_next: &'a [SC::Challenge],
+    pub main_next: &'a [Challenge<SC>],
 
     /// Auxiliary trace values (local row)
-    pub aux_local: &'a [SC::Challenge],
+    pub aux_local: &'a [Challenge<SC>],
 
     /// Auxiliary trace values (next row)
-    pub aux_next: &'a [SC::Challenge],
+    pub aux_next: &'a [Challenge<SC>],
 
     /// Selector: 1 on first row, 0 elsewhere
-    pub is_first_row: SC::Challenge,
+    pub is_first_row: Challenge<SC>,
 
     /// Selector: 1 on last row, 0 elsewhere
-    pub is_last_row: SC::Challenge,
+    pub is_last_row: Challenge<SC>,
 
     /// Selector: 1 on all rows except last, 0 on last
-    pub is_transition: SC::Challenge,
+    pub is_transition: Challenge<SC>,
 
     /// Randomness for combining constraints
-    pub alpha: SC::Challenge,
+    pub alpha: Challenge<SC>,
 
     /// Accumulated constraint value
-    pub accumulator: SC::Challenge,
+    pub accumulator: Challenge<SC>,
 }
 
 /// Simple view for verifier (just vectors of challenges)
+#[derive(Copy, Clone)]
 pub struct VerifierView<'a, EF> {
     local: &'a [EF],
     next: &'a [EF],
 }
 
-impl<'a, EF: ExtensionField<impl Field>> VerifierView<'a, EF> {
+impl<'a, EF: Copy> VerifierView<'a, EF> {
     pub fn new(local: &'a [EF], next: &'a [EF]) -> Self {
         Self { local, next }
     }
@@ -171,14 +170,41 @@ impl<'a, EF: ExtensionField<impl Field>> VerifierView<'a, EF> {
     }
 }
 
+// Implement Matrix trait for VerifierView
+impl<'a, EF: Copy + Send + Sync> p3_matrix::Matrix<EF> for VerifierView<'a, EF> {
+    fn width(&self) -> usize {
+        self.local.len()
+    }
+
+    fn height(&self) -> usize {
+        2 // local and next
+    }
+
+    unsafe fn get_unchecked(&self, row: usize, col: usize) -> EF {
+        match row {
+            0 => *self.local.get_unchecked(col),
+            1 => *self.next.get_unchecked(col),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+
+    fn row_slice(&self, r: usize) -> Option<&[EF]> {
+        match r {
+            0 => Some(self.local),
+            1 => Some(self.next),
+            _ => None,
+        }
+    }
+}
+
 impl<'a, SC> AirBuilder for VerifierFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
+    SC: crate::StarkGenericConfig,
 {
     type F = Val<SC>;
     type Expr = Challenge<SC>;
     type Var = Challenge<SC>;
-    type M = VerifierView<'a, SC::Challenge>;
+    type M = VerifierView<'a, Challenge<SC>>;
 
     fn main(&self) -> Self::M {
         VerifierView::new(self.main_local, self.main_next)
@@ -204,11 +230,11 @@ where
 
 impl<'a, SC> ExtensionBuilder for VerifierFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
+    SC: crate::StarkGenericConfig,
 {
-    type EF = SC::Challenge;
-    type ExprEF = SC::Challenge;
-    type VarEF = SC::Challenge;
+    type EF = Challenge<SC>;
+    type ExprEF = Challenge<SC>;
+    type VarEF = Challenge<SC>;
 
     fn assert_zero_ext<I>(&mut self, x: I)
     where
@@ -220,9 +246,9 @@ where
 
 impl<'a, SC> AuxBuilder for VerifierFolder<'a, SC>
 where
-    SC: crate::StarkConfig,
+    SC: crate::StarkGenericConfig,
 {
-    type MAux = VerifierView<'a, SC::Challenge>;
+    type MAux = VerifierView<'a, Challenge<SC>>;
 
     fn aux(&self) -> Self::MAux {
         VerifierView::new(self.aux_local, self.aux_next)

@@ -1,4 +1,4 @@
-# p3-uni-stark-mt
+# p3-md
 
 Multi-trace STARK prover for Plonky3 with minimal abstractions.
 
